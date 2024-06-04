@@ -1,0 +1,4 @@
+gym==0.26.2
+pytorch_lightning==2.2.5
+torch==2.3.0
+box2d-py
