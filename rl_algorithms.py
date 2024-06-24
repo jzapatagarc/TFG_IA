@@ -5,30 +5,56 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 from typing import Dict
-import gym
+import gymnasium as gym
 from agent import ActorCritic, RolloutBuffer
 import socket
 import pickle
 
+# Nombre alumno: José David Zapata García
+# Usuario campus: jzapatagarc
+
 
 class ExperienceDataset(Dataset):
     """
-    PyTorch Dataset for loading experiences from RolloutBuffer.
+    A PyTorch Dataset for loading experiences directly from a RolloutBuffer.
+    This dataset facilitates easy integration with PyTorch DataLoader for efficient training.
 
     Args:
-        buffer (RolloutBuffer): Buffer storing experiences.
+        buffer (RolloutBuffer): A buffer that stores training experiences.
     """
 
     def __init__(self, buffer: RolloutBuffer):
+        """
+        Initializes the dataset using data from a RolloutBuffer.
+
+        Args:
+            buffer (RolloutBuffer): The buffer from which to load experiences.
+        """
         self.buffer = buffer
+        # Retrieve all data from the buffer.
         self.data = buffer.get_data()
 
     def __len__(self) -> int:
-        """Return the number of experiences in the dataset."""
+        """
+        Returns the total number of experiences in the buffer.
+
+        Returns:
+            int: The number of experiences.
+        """
         return len(self.buffer)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get an experience at a specific index."""
+        """
+        Retrieves a single experience at a specific index.
+
+        Args:
+            idx (int): The index of the experience to retrieve.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary containing all components of an experience,
+                                     such as state, action, etc.
+        """
+        # Return a dictionary of tensors, each tensor corresponds to a data point at the index `idx`.
         return {
             'state': self.data['states'][idx],
             'action': self.data['actions'][idx],
@@ -39,232 +65,124 @@ class ExperienceDataset(Dataset):
         }
 
 
-def save_model(model, method, env_name, model_path):
+def save_model(model: nn.Module, method: str, env_name: str, model_path: str):
     """
-    Save the model with a name that starts with the method and ends with the environment name,
-    and remove any previous models with the same naming pattern.
+    Saves the specified model under a unique filename that includes the method and environment name.
+    Existing models with the same name are removed to ensure only the latest model is saved.
 
     Args:
         model (nn.Module): The model to save.
-        method (str): The method name ('a3c' or 'ppo').
-        env_name (str): The environment name.
-        model_path (str): The directory path where the model will be saved.
+        method (str): The training method, used as part of the filename.
+        env_name (str): The environment name, used as part of the filename.
+        model_path (str): The path to the directory where the model should be saved.
     """
-    # Find existing model files that match the naming pattern
+    # Construct the filename pattern to find existing models to remove
     model_files = [f for f in os.listdir(model_path) if f.startswith(
         method) and f.endswith(env_name + ".pth")]
 
-    # Remove existing model files
+    # Remove any existing models that match the pattern
     for model_file in model_files:
         os.remove(os.path.join(model_path, model_file))
+        print(f"Removed old model {model_file}")
 
-    # Save the new model
+    # Save the new model with a filename that includes the method and environment name
     model_filename = f"{method}_{env_name}.pth"
     torch.save(model.state_dict(), os.path.join(model_path, model_filename))
     print(f"Model saved as {model_filename}")
 
 
-def apply_a3c_gradients(gradients: Dict[str, torch.Tensor], model: nn.Module, optimizer: optim.Optimizer):
+def apply_a3c_gradients(gradients: Dict[str, torch.Tensor], model: nn.Module, optimizer: optim.Optimizer) -> Dict[str, torch.Tensor]:
     """
-    Apply A3C gradients to the global model.
+    Apply A3C gradients to the global model received from multiple agents.
 
     Args:
-        gradients (Dict[str, torch.Tensor]): Gradientes to apply.
-        model (nn.Module): Global model.
-        optimizer (optim.Optimizer): Model's optimizer.
+        gradients (Dict[str, torch.Tensor]): Gradients to apply, mapped by parameter names.
+        model (nn.Module): The global model to which gradients will be applied.
+        optimizer (optim.Optimizer): The optimizer managing the model's parameters.
 
     Returns:
-        Dict[str, torch.Tensor]: Parámetros del modelo actualizado.
+        Dict[str, torch.Tensor]: The updated parameters of the model after applying gradients.
     """
-    # Reset gradients in the optimizer before applying new ones
+    # Reset existing gradients in the optimizer to avoid accumulation from previous updates
     optimizer.zero_grad()
 
-    # Iterate over all named parameters in the model
+    # Apply each received gradient to the corresponding parameter in the model
+    missing_gradients = []
     for name, param in model.named_parameters():
         if name in gradients:
-            # Replace the current gradient for each parameter with the new gradient received
-            param.grad = gradients[name]
+            # Ensure the gradient tensor is detached and resides on the same device as the model parameter
+            grad = gradients[name].detach()
+            grad = grad.to(param.device)
+            param.grad = grad
+        else:
+            # Collect names of parameters for which no gradient was received
+            missing_gradients.append(name)
+
+    # Check for any missing gradients and handle accordingly
+    if missing_gradients:
+        print(
+            f"Warning: No gradients received for parameters: {missing_gradients}")
 
     # Perform a single optimization step to update the model parameters
     optimizer.step()
 
-    # Collect and return the updated parameters
     return {name: param.data for name, param in model.named_parameters()}
 
 
-def apply_ppo_experiences(experiences: Dict[str, torch.Tensor], model: nn.Module, optimizer: optim.Optimizer):
+def apply_ppo_experiences(experiences: Dict[str, torch.Tensor], model: nn.Module, optimizer: optim.Optimizer) -> Dict[str, torch.Tensor]:
     """
-    Apply PPO experiences to the global model.
+    Apply PPO experiences to the global model using the Proximal Policy Optimization (PPO) algorithm updates.
 
     Args:
-        experiences (Dict[str, torch.Tensor]): Experiences to apply.
-        model (nn.Module): Global model.
+        experiences (Dict[str, torch.Tensor]): Dictionary containing tensors of states, actions, 
+                                               log probabilities, values, returns, and advantages from rollout.
+        model (nn.Module): The policy and value network.
         optimizer (optim.Optimizer): Optimizer for the model.
 
     Returns:
-        Dict[str, torch.Tensor]: Updated model parameters.
+        Dict[str, torch.Tensor]: Dictionary of updated model parameters.
     """
     # Extract components from the experiences dictionary
     states = experiences['states']
     actions = experiences['actions']
-    log_probs = experiences['log_probs']
+    old_log_probs = experiences['log_probs']
     values = experiences['values']
     returns = experiences['returns']
     advantages = experiences['advantages']
 
-    # Reset the optimizer's gradient buffer before calculating new gradients
+    # Reset the optimizer's gradient buffer to avoid accumulation from previous updates
     optimizer.zero_grad()
 
-    # Forward pass through the model to get action probabilities and state value estimates for the given states
+    # Forward pass to get new action probabilities and state values
     new_action_probs, new_values = model(states)
 
-    # Calculate the new log probabilities for the actions taken
+    # Calculate the log probabilities of the actions taken, ensure actions are in the correct format
     new_log_probs = torch.log(new_action_probs.gather(
-        1, actions.unsqueeze(-1)).squeeze(-1))
+        1, actions.unsqueeze(-1).long()).squeeze(-1))
 
-    # Calculate the ratio of new to old probabilities, clip it, and calculate the PPO objective
-    ratios = torch.exp(new_log_probs - log_probs)
+    # Calculate the ratio of new to old probabilities, and apply the clipping technique
+    ratios = torch.exp(new_log_probs - old_log_probs)
     surr1 = ratios * advantages
     surr2 = torch.clamp(ratios, 1.0 - 0.2, 1.0 + 0.2) * advantages
+    # Minimize the negative of the clipped surrogate objective
     actor_loss = -torch.min(surr1, surr2).mean()
 
-    # Calculate the critic loss using mean squared error between estimated and actual returns
+    # Calculate the critic loss using MSE between predicted values and the computed returns
     critic_loss = F.mse_loss(new_values.squeeze(), returns)
 
-    # Calculate the entropy bonus for encouraging exploration
-    entropy_bonus = (new_action_probs * torch.log(new_action_probs)).mean()
+    # Entropy bonus to encourage exploration
+    # Small epsilon to prevent log(0)
+    entropy_bonus = -(new_action_probs *
+                      torch.log(new_action_probs + 1e-10)).mean()
 
-    # Combine the actor loss, critic loss, and entropy bonus into total loss
-    loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy_bonus
+    # Total loss combines actor loss, critic loss, and entropy bonus
+    loss = actor_loss + 0.5 * critic_loss + 0.01 * entropy_bonus
 
-    # Perform backpropagation to compute gradients
+    # Backpropagate the loss, compute gradients
     loss.backward()
 
-    # Update model parameters using the optimizer
+    # Update the model parameters
     optimizer.step()
 
     # Return the updated model parameters
     return {name: param.data for name, param in model.named_parameters()}
-
-
-def receive_gradients(port=0) -> Dict[str, torch.Tensor]:
-    """
-    Receive gradients from the server.
-
-    Args:
-        port (int): The port number on which the server listens for incoming gradient updates.
-
-    Returns:
-        Dict[str, torch.Tensor]: Gradients received from the server.
-    """
-    # Create a TCP/IP socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        # Connect the socket to the server address and port
-        sock.connect(('127.0.0.1', port))
-        # Try to receive data from the socket up to 4096 bytes of data.
-        data = sock.recv(4096)
-
-    # Deserialize the data received from the server
-    gradients = pickle.loads(data)
-
-    # Return the deserialized gradients
-    return gradients
-
-
-def receive_experiences(port=0) -> Dict[str, torch.Tensor]:
-    """
-    Receive experiences from the server.
-
-    Args:
-        port (int): The port number on which the server listens for incoming experiences.
-
-    Returns:
-        Dict[str, torch.Tensor]: Experiences received from the server.
-    """
-    # Create a TCP/IP socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        # Connect the socket to the server address and port
-        sock.connect(('127.0.0.1', port))
-        # Try to receive data from the socket up to 4096 bytes of data.
-        data = sock.recv(4096)
-
-    # Return the deserialized experiences
-    return pickle.loads(data)
-
-
-def a3c_training(env_name: str, max_epochs: int, output_checkpoint_path: str):
-    """
-    Train a model using the A3C algorithm.
-
-    Args:
-        env_name (str): Name of the environment to train on.
-        max_epochs (int): Number of epochs to train.
-        output_checkpoint_path (str): Path to save the trained model.
-    """
-    # Initialize the environment
-    env = gym.make(env_name)
-    # Get the number of input features from the environment
-    input_dim = env.observation_space.shape[0]
-    output_dim = env.action_space.n  # Get the number of actions from the environment
-
-    # Create the A3C model
-    model = ActorCritic(input_dim, output_dim)
-    # Initialize the optimizer
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-    # Set the model to training mode
-    model.train()
-
-    # Training loop
-    for epoch in range(max_epochs):
-        # Receive gradients
-        gradients = receive_gradients()
-        # Apply received gradients to the model
-        updated_params = apply_a3c_gradients(gradients, model, optimizer)
-
-        # Print the progress after each epoch
-        print(
-            f"Epoch {epoch+1}/{max_epochs}, Updated Parameters: {updated_params}")
-
-    # Save the trained model to the specified path
-    save_model(model, 'a3c', env_name, output_checkpoint_path)
-    print(f"A3C model saved to {output_checkpoint_path}")
-
-
-def ppo_training(env_name: str, max_epochs: int, output_checkpoint_path: str):
-    """
-    Train a model using the PPO algorithm.
-
-    Args:
-        env_name (str): Name of the environment to train on.
-        max_epochs (int): Number of epochs to train.
-        output_checkpoint_path (str): Path to save the trained model.
-    """
-    # Initialize the training environment
-    env = gym.make(env_name)
-    # Number of input features from the environment
-    input_dim = env.observation_space.shape[0]
-    output_dim = env.action_space.n  # Number of possible actions in the environment
-
-    # Initialize the PPO model
-    model = ActorCritic(input_dim, output_dim)
-    # Set up the optimizer for the model
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-    # Set the model to training mode
-    model.train()
-
-    # Loop through the specified number of training epochs
-    for epoch in range(max_epochs):
-        # Receive training experiences
-        experiences = receive_experiences()
-        # Apply these experiences to the model
-        updated_params = apply_ppo_experiences(experiences, model, optimizer)
-
-        # Print the progress after each epoch
-        print(
-            f"Epoch {epoch+1}/{max_epochs}, Updated Parameters: {updated_params}")
-
-    # After training, save the model to the specified path
-    save_model(model, 'ppo', env_name, output_checkpoint_path)
-    print(f"PPO model saved to {output_checkpoint_path}")

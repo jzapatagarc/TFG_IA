@@ -1,76 +1,58 @@
-import argparse
 import os
-import threading
-import time
-import socket
+import argparse
 import pickle
-import gym
+import gymnasium as gym
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.optim import RMSprop
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
+import time
+from multiprocessing import Pipe
+from multiprocessing.connection import Connection
+import uuid
+from pytorch_lightning.utilities.types import STEP_OUTPUT, TRAIN_DATALOADERS
+from typing import Any, Dict, Tuple, Optional, List
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import Callback
+from gymnasium.wrappers import RecordEpisodeStatistics
 
-# Global Variables: Hyperparameters for the agent's learning and exploration
-BATCH_SIZE = 256  # Number of experiences sampled from memory to learn the policy
-GAMMA = 0.75  # Discount factor for future rewards
+# Nombre alumno: José David Zapata García
+# Usuario campus: jzapatagarc
 
-# Paths configuration for the models
+# Paths configuration for the models and data
 MODEL_SAVE_PATH = '/app/local_models'  # Path to save the local model
-MODEL_LOAD_PATH = '/app/global_models'  # Path to load the global model
+# Path to load the global model
+MODEL_LOAD_PATH = '/home/david/Documents/TFG/global'
+DATA_PATH = '/home/david/Documents/TFG/data'
+METRICS_PATH = '/home/david/Documents/TFG/metrics'
 
-STOP_EVENT = threading.Event()  # Event to signal when to stop training
-
-
-def check_for_model_update(model):
-    """
-    Check the server for an updated model and load it if available.
-
-    This function connects to the server specified in the model's server_address attribute.
-    It sends a request to check for an update, receives the updated model state if available,
-    and loads the new state into the model.
-    """
-    # Create a socket object using IPv4 and TCP
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        # Connect to the server using the address provided in the model
-        sock.connect(model.server_address)
-        # Send a request to the server to check for an update
-        sock.sendall(b"check_update")
-        # Receive data from the server (up to 4096 bytes)
-        data = sock.recv(4096)
-        # If data is received from the server
-        if data:
-            # Deserialize the received data to get the new model state
-            new_state_dict = pickle.loads(data)
-            # Load the new state into the model
-            model.load_state_dict(new_state_dict)
-            # Print a message indicating the model has been updated
-            print("Updated model received from server.")
+last_loaded_model = None
 
 
 class RolloutBuffer:
-    """A buffer for storing trajectory data for PPO or A3C training.
+    """
+    RolloutBuffer is a class that stores the experiences of an agent during training.
+    This includes observations, actions, rewards, and other relevant data.
 
-    This buffer stores states, actions, rewards, and other data necessary for training
-    Proximal Policy Optimization (PPO) or Asynchronous Advantage Actor-Critic (A3C) models.
+    Attributes:
+        buffer_size (int): Maximum size of the buffer to store experiences.
+        observation_space (gym.Space): The observation space of the environment.
+        action_space (gym.Space): The action space of the environment.
+        method (str): The training method used.
+        gamma (float): The discount factor for future rewards.
+        gae_lambda (float): The lambda for Generalized Advantage Estimation (GAE).
+        use_gae (bool): Flag to determine whether to use GAE.
+        env_name (str): The name of the environment.
+        score_threshold (int): The score threshold for success in the environment.
     """
 
-    def __init__(self, buffer_size, observation_space, action_space, gamma=0.99, gae_lambda=0.95, use_gae=True, method='ppo'):
-        """Initialize the rollout buffer.
-
-        Args:
-            buffer_size (int): Maximum size of the buffer.
-            observation_space (gym.spaces.Space): The observation space of the environment.
-            action_space (gym.spaces.Space): The action space of the environment.
-            gamma (float): Discount factor for future rewards.
-            gae_lambda (float): Lambda parameter for Generalized Advantage Estimation (GAE).
-            use_gae (bool): Whether to use GAE for advantage calculation.
-            method (str): The training method to use ('ppo' or 'a3c').
-        """
-        # Initialize buffers for states, actions, rewards, dones, log probabilities, values, returns, and advantages
+    def __init__(self, buffer_size: int, observation_space: gym.Space, action_space: gym.Space, method: str, gamma: float = 0.9, gae_lambda: float = 0.95, use_gae: bool = True, env_name: str = '', score_threshold: int = 195):
+        """Initialize the Rollout Buffer with additional parameters for score tracking."""
+        # Creating tensors to store experiences
         self.states = torch.zeros(
             (buffer_size, *observation_space.shape), dtype=torch.float32)
         self.actions = torch.zeros(buffer_size, dtype=torch.int32) if isinstance(
@@ -82,115 +64,225 @@ class RolloutBuffer:
         self.returns = torch.zeros(buffer_size, dtype=torch.float32)
         self.advantages = torch.zeros(buffer_size, dtype=torch.float32)
 
-        # Set discount factor, GAE lambda, and other parameters
+        # Configuration parameters for calculations
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.use_gae = use_gae
+        # Pointer to the current insert position in the buffer
         self.ptr = 0
+        # Start index for the next calculation of returns
         self.path_start_idx = 0
         self.max_size = buffer_size
         self.method = method
+        self.env_name = env_name
 
-    def insert(self, state, action, reward, done, log_prob, value):
-        """Insert a new experience into the buffer."""
+        # Runtime data for metrics
+        # Scores per episode
+        self.episode_scores = []
+        # For LunarLander-v2
+        self.successful_landings = 0
+        self.total_episodes = 0
+        self.score_threshold = score_threshold
+        # Track when score threshold is first reached
+        self.threshold_reached_times = []
+        # Steps in the current episode
+        self.current_episode_steps = 0
+        # Track duration of each training epoch
+        self.epoch_times = []
+
+    def insert(self, state: torch.Tensor, action: int or torch.Tensor, reward: float, done: bool, log_prob: float, value: float):
+        """
+        Inserts new experience data into the buffer.
+
+        Args:
+            state (torch.Tensor): The state observed by the agent.
+            action (int or torch.Tensor): The action taken by the agent.
+            reward (float): The reward received after taking the action.
+            done (bool): Whether the episode has ended.
+            log_prob (float): The log probability of the action.
+            value (float): The value estimate from the critic network.
+        """
         if self.ptr < self.max_size:
-            # Store the given state, action, reward, done flag, log probability, and value
             self.states[self.ptr] = state
             self.actions[self.ptr] = action
             self.rewards[self.ptr] = reward
             self.dones[self.ptr] = done
             self.log_probs[self.ptr] = log_prob
             self.values[self.ptr] = value
-            self.ptr += 1  # Move the pointer to the next position
-            print(f"Data inserted. Current buffer size: {self.ptr}")
+            self.ptr += 1
+
+            # Update score tracking for the current episode
+            if len(self.episode_scores) == self.total_episodes:
+                self.episode_scores.append(reward)
+            else:
+                self.episode_scores[-1] += reward
+            self.current_episode_steps += 1
+
+            # Check if the score threshold is reached for the first time
+            if self.episode_scores[-1] >= self.score_threshold and (len(self.threshold_reached_times) == self.total_episodes):
+                self.threshold_reached_times.append(self.current_episode_steps)
+
+            if done:
+                self.total_episodes += 1
+                self.episode_scores.append(0)
+                self.current_episode_steps = 0  # Reset step count for the new episode
+
         else:
             print("Buffer is full.")
 
-    def process_for_a3c(self):
-        """Processes the buffer data for A3C method after an episode ends."""
-        # Calculate returns and advantages and send gradients to server
+    def start_epoch(self):
+        """Records the start time of an epoch for measuring duration."""
+        self.start_time = time.time()
+
+    def finish_epoch(self):
+        """
+        Records the end of an epoch, calculates its duration, and prints it.
+        Resets the start time for the next epoch.
+        """
+        if self.start_time is not None:
+            epoch_duration = time.time() - self.start_time
+            self.epoch_times.append(epoch_duration)
+            print(f"Epoch finished in {epoch_duration:.2f} seconds.")
+            self.start_time = None
+
+    def get_metrics(self) -> dict:
+        """
+        Computes and returns various training metrics based on the data collected.
+
+        Returns:
+            dict: A dictionary containing metrics such as average score, success rate,
+            and training time.
+        """
+        training_time = sum(self.epoch_times)
+
+        # Initialize metrics that may not apply to all environments
+        average_time_to_threshold = None
+        success_rate = None
+
+        # Calculate average time to threshold for CartPole-v1
+        if self.env_name == 'CarRacing-v0' and self.threshold_reached_times:
+            average_time_to_threshold = sum(
+                self.threshold_reached_times) / len(self.threshold_reached_times)
+
+        # Calculate success rate for LunarLander-v2
+        if self.env_name == 'LunarLander-v2' and self.total_episodes > 0:
+            success_rate = self.successful_landings / self.total_episodes
+
+        metrics = {
+            'total_episodes': self.total_episodes,
+            'average_time_to_threshold': average_time_to_threshold,
+            'success_rate': success_rate,
+            'training_time': training_time,
+        }
+
+        # Remove None entries to clean up the metrics dictionary
+        return {k: v for k, v in metrics.items() if v is not None}
+
+    def send_metrics_to_server(self, metrics_data: dict):
+        """
+        Serializes and sends accumulated metrics to the server for further analysis.
+
+        Dnamically constructs a filename using the method and environment name, the metrics
+        data is then serialized using pickle and written to a file.
+
+        Args:
+            metrics_data (dict): The metrics data dictionary containing values that need to be analyzed.
+        """
+        # Use self.method and self.env_name to dynamically set the file name and method
+        env_name = self.env_name
+        method_name = self.method
+        timestamp = int(time.time())
+        # Construct the file name with the method, environment, and timestamp
+        file_name = f"{method_name}_{env_name}_metrics_{timestamp}.pkl"
+        file_path = os.path.join(METRICS_PATH, file_name)
+
+        # Open the file at file_path in write-binary ('wb') mode.
+        with open(file_path, 'wb') as f:
+            pickle.dump(metrics_data, f)
+        print(f"Metrics data sent to server with file: {file_name}")
+
+    def process_for_a3c(self, gradients: Dict[str, torch.Tensor]):
+        """
+        Processes the buffer data specifically for the A3C training method after an episode ends.
+
+        This method completes the path computation for the current episode using the finish_path method,
+        sends the gradients to the server for global model updates, and resets the buffer pointer to zero.
+
+        Args:
+            gradients (Dict[str, torch.Tensor]): Gradients to be sent to the server.
+        """
         self.finish_path(last_value=0)
-        self.send_gradients_to_server()
-        # Reset buffer pointer after processing
+        self.send_gradients_to_server(gradients)
         self.ptr = 0
 
     def process_for_ppo(self):
-        """Processes the buffer data for PPO method if buffer is full or episode ends."""
-        # Check if buffer is full or last experience was terminal
-        if self.ptr == self.max_size or self.dones[self.ptr-1]:
+        """
+        Processes the buffer data for the PPO training method either when the buffer is full or an episode ends.
+
+        Checks if the buffer is at maximum capacity or the last experience recorded was the end of an episode. If true,
+        it finalizes the path computations, sends the experience data to the server, and resets the buffer index.
+        """
+        if self.ptr == self.max_size or self.dones[self.ptr - 1]:
             self.finish_path(last_value=0)
             self.send_experiences_to_server()
-            # Reset buffer pointer after processing
             self.ptr = 0
 
     def send_experiences_to_server(self):
-        """Send experiences to the server."""
-        # Serialize the buffer data to send to the server
-        data = pickle.dumps(self.get_data())
-        # Establish a connection with the server
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.connect(self.server_address)
-            # Send the serialized data
-            sock.sendall(data)
-            # Receive and print the response from the server
-            response = sock.recv(1024)
-        print("Received response from server:", response.decode())
+        """
+        Serializes and sends experience data to the server using a file.
 
-    def discounted_cumsum(self, x, discount):
-        """Calculate the discounted cumulative sum of a tensor.
+        This function generates a unique file name using a UUID, combines it with the environment name,
+        and dumps the buffer's data into a file. This data is then available for the server to process.
+        """
+        # Generate a unique identifier for the file
+        unique_id = uuid.uuid4()
+        data = self.get_data()
+
+        env_name = self.env_name if isinstance(
+            self.env_name, str) else self.env_name.spec.id
+        file_path = os.path.join(
+            DATA_PATH, f"ppo_data_{env_name}_{unique_id}.pkl")
+        with open(file_path, 'wb') as f:
+            pickle.dump({
+                'type': 'ppo',
+                'model_data': data,
+                'env_name': self.env_name if isinstance(self.env_name, str) else self.env_name.spec.id
+            }, f)
+        print(f"Experiences data sent to server with file: {file_path}")
+
+    def send_gradients_to_server(self, gradients: Dict[str, torch.Tensor]):
+        """
+        Serializes and sends gradient data to the server using a file.
+
+        Similar to sending experiences, it generates a unique file name with a UUID,
+        and stores the gradients data into a file for the server's global model update process.
 
         Args:
-            x (torch.Tensor): The input tensor.
-            discount (float): The discount factor.
-
-        Returns:
-            torch.Tensor: The discounted cumulative sum.
+            gradients (Dict[str, torch.Tensor]): Gradients to be sent to the server.
         """
-        # Initialize the result tensor with the same size and type as x
-        result = torch.zeros_like(x)
-        addend = 0
-        # Iterate over the elements of x in reverse order to calculate the discounted cumulative sum
-        for t in reversed(range(len(x))):
-            result[t] = x[t] + discount * addend
-            addend = result[t]
-        return result
+        unique_id = uuid.uuid4()
+        env_name = self.env_name if isinstance(
+            self.env_name, str) else self.env_name.spec.id
+        print(self.env_name)
+        print(env_name)
+        file_path = os.path.join(
+            DATA_PATH, f"a3c_data_{env_name}_{unique_id}.pkl")
+        with open(file_path, 'wb') as f:
+            pickle.dump({
+                'type': 'a3c',
+                'model_data': gradients,
+                'env_name': self.env_name if isinstance(self.env_name, str) else self.env_name.spec.id
+            }, f)
 
-    def finish_path(self, last_value=0):
-        """Finish the path and calculate returns and advantages using Generalized Advantage Estimation (GAE) if enabled."""
-        # Path slice to calculate values for
-        path_slice = slice(self.path_start_idx, self.ptr)
-        # If using GAE, compute advantages and returns differently
-        if self.use_gae:
-            # Append the last value to rewards and values for calculation
-            rewards = torch.cat(
-                (self.rewards[path_slice], torch.tensor([last_value], dtype=torch.float32)))
-            values = torch.cat((self.values[path_slice], torch.tensor(
-                [last_value], dtype=torch.float32)))
-            dones = torch.cat(
-                (self.dones[path_slice], torch.tensor([False], dtype=torch.bool)))
-            # Convert boolean tensor to float for operations
-            dones = dones.to(torch.float32)
+    def get_data(self) -> dict:
+        """
+        Retrieves the buffered data up to the current pointer position.
 
-            deltas = rewards[:-1] + self.gamma * \
-                values[1:] * (1 - dones[:-1]) - values[:-1]
-            self.advantages[path_slice] = self.discounted_cumsum(
-                deltas, self.gamma * self.gae_lambda)
-            self.returns[path_slice] = self.discounted_cumsum(rewards, self.gamma)[
-                :-1]
-        else:
-            # If not using GAE, simply calculate cumulative returns from rewards
-            rewards = self.rewards[self.path_start_idx:self.ptr]
-            self.returns[self.path_start_idx:self.ptr] = self.discounted_cumsum(
-                rewards, self.gamma)
-
-        # Reset the path start index for the next batch
-        self.path_start_idx = self.ptr
-
-    def get_data(self):
-        """Get the data from the buffer.
+        Raises:
+            ValueError: If the buffer does not contain enough data to fill up to its maximum size.
 
         Returns:
-            dict: A dictionary containing states, actions, rewards, dones, log_probs, values, returns, and advantages.
+            dict: A dictionary containing slices of data arrays up to the current buffer pointer.
         """
         if self.ptr < self.max_size:
             raise ValueError(
@@ -208,144 +300,218 @@ class RolloutBuffer:
         }
         return data
 
-    def __len__(self):
-        """Get the current size of the buffer.
+    def discounted_cumsum(self, x: torch.Tensor, discount: float) -> torch.Tensor:
+        """
+        Calculates the discounted cumulative sum of rewards or advantages.
+
+        Args:
+            x (torch.Tensor): Input tensor of rewards or values.
+            discount (float): Discount factor to be applied.
 
         Returns:
-            int: The number of entries currently in the buffer.
+            torch.Tensor: Tensor of the same shape as input with discounted cumulative sums.
+        """
+        result = torch.zeros_like(x)
+        addend = 0
+        for t in reversed(range(len(x))):
+            result[t] = x[t] + discount * addend
+            addend = result[t]
+        return result
+
+    def finish_path(self, last_value: float = 0):
+        """
+        Completes the calculations for the current episode path in the buffer,
+        computing the returns and advantages using Generalized Advantage Estimation (GAE) if enabled.
+
+        Args:
+            last_value (float): The bootstrap value used for calculating returns at the end of the path.
+        """
+        # Define the slice of the buffer to process.
+        path_slice = slice(self.path_start_idx, self.ptr)
+        # If using GAE, compute advantages and returns differently
+        if self.use_gae:
+            # Append the last value to rewards and values for calculation
+            rewards = torch.cat(
+                (self.rewards[path_slice], torch.tensor([last_value], dtype=torch.float32)))
+            values = torch.cat((self.values[path_slice], torch.tensor(
+                [last_value], dtype=torch.float32)))
+            dones = torch.cat(
+                (self.dones[path_slice], torch.tensor([False], dtype=torch.bool)))
+            # Convert boolean tensor to float for operations
+            dones = dones.to(torch.float32)
+
+            # Calculate temporal differences
+            deltas = rewards[:-1] + self.gamma * \
+                values[1:] * (1 - dones[:-1]) - values[:-1]
+            self.advantages[path_slice] = self.discounted_cumsum(
+                deltas, self.gamma * self.gae_lambda)
+            self.returns[path_slice] = self.discounted_cumsum(rewards, self.gamma)[
+                :-1]
+        else:
+            # If not using GAE, simply calculate cumulative returns from rewards
+            rewards = self.rewards[self.path_start_idx:self.ptr]
+            self.returns[self.path_start_idx:self.ptr] = self.discounted_cumsum(
+                rewards, self.gamma)
+
+        # Reset the path start index for the next batch
+        self.path_start_idx = self.ptr
+
+    def __len__(self) -> int:
+        """
+        Returns the current number of entries in the buffer.
+
+        Returns:
+            int: The current number of entries stored in the buffer.
         """
         return self.ptr
 
 
 class ActorCritic(nn.Module):
     """
-    A neural network model with an actor and a critic.
+    An implementation of the Actor-Critic network, a neural network used in reinforcement learning
+    that contains both policy (actor) and value (critic) network heads.
 
-    Args:
-        num_inputs (int): Number of input features.
-        num_outputs (int): Number of output actions.
+    Attributes:
+        common (nn.Sequential): Shared layers of the neural network.
+        actor (nn.Linear): The actor head that outputs action probabilities.
+        critic (nn.Linear): The critic head that outputs a value estimate.
     """
 
-    def __init__(self, num_inputs, num_outputs, server_address=('host.docker.internal', 0)):
+    def __init__(self, num_inputs: int, num_outputs: int):
         """
-        Initializes the ActorCritic network with specified number of inputs and outputs, and optionally,
-        a server address for communication if required.
+        Initializes the ActorCritic network with specified number of inputs and outputs.
 
         Args:
-            num_inputs (int): Number of input features.
-            num_outputs (int): Number of output actions.
-            server_address (tuple): The server address for network communication, default is local Docker internal host.
+            num_inputs (int): The number of input features.
+            num_outputs (int): The number of possible actions (output dimension of the actor).
         """
         super(ActorCritic, self).__init__()
-        # Address for connecting to external processes if needed
-        self.server_address = server_address
-
-        # Shared layers for both actor and critic
-        # These layers process the input data and serve for the actor and the critic.
+        # Common layers that both the actor and critic will share.
         self.common = nn.Sequential(
-            nn.Linear(num_inputs, 128),  # First layer with ReLU activation
-            nn.ReLU(),
-            # Second layer to increase representational power
-            nn.Linear(128, 128),
-            nn.ReLU()
+            nn.Linear(num_inputs, 512),
+            nn.BatchNorm1d(512),  # Batch normalization
+            nn.LeakyReLU(0.01),   # LeakyReLU to prevent dead neurons
+
+            nn.Linear(512, 512),
+            nn.BatchNorm1d(512),
+            nn.LeakyReLU(0.01),
+
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.01)
         )
 
-        # Actor network for action selection
-        # Outputs a vector of action probabilities, based on the state representation
-        # from the common layers.
-        self.actor = nn.Linear(128, num_outputs)
+        # Actor head: outputs the probability distribution over actions
+        self.actor = nn.Linear(256, num_outputs)
+        # Critic head: outputs a single value estimating the state value
+        self.critic = nn.Linear(256, 1)
 
-        # Critic network for state value prediction
-        # Iutputs a single value representing the expected return from the current state,
-        # based on the common layer outputs.
-        self.critic = nn.Linear(128, 1)
-
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> (torch.Tensor, torch.Tensor):
         """
-        Forward pass through the network. Takes the input tensor, processes it through shared layers,
-        and then separately through the actor and critic to produce action probabilities and state values.
+            Defines the forward pass of the Actor-Critic model.
 
-        Args:
-            x (Tensor): Input tensor containing state information from the environment.
+            Args:
+                x (torch.Tensor): The input tensor containing features of the environment state.
 
-        Returns:
-            Tensor, Tensor: Action probabilities (from the actor) and state value (from the critic).
-        """
-        x = self.common(x)  # Pass input through common layers
-        # Softmax over actor output for probability distribution
-        action_probs = F.softmax(self.actor(x), dim=-1)
-        state_values = self.critic(x)  # Single value output from critic
+            Returns:
+                tuple: A tuple containing:
+                    - action_probs (torch.Tensor): The probabilities of each action.
+                    - state_values (torch.Tensor): The value estimate of the input state.
+            """
+        # Pass input through the common layers
+        x = self.common(x)
+
+        x = F.relu(x)
+        # Softmax to get probabilities from the actor output
+        action_probs = F.softmax(self.actor(x), dim=1)
+        # Get the value estimate from the critic output
+        state_values = self.critic(x)
         return action_probs, state_values
 
 
 class LightningActorCritic(pl.LightningModule):
     """
-    PyTorch Lightning module for training an actor-critic model using either PPO or A3C methods.
-    This class handles the training logic, including the forward pass, loss computation, and optimizer configuration.
+    PyTorch Lightning module for training an actor-critic model using methods like PPO and A3C.
+    It leverages the capabilities of PyTorch Lightning for efficient training loops, logging, and model management.
     """
 
-    def __init__(self, env, model, memory, hparams, method='ppo'):
+    def __init__(self, env: gym.Env, model: torch.nn.Module, memory: RolloutBuffer, hparams: Dict[str, Any], method: str = 'ppo'):
         """
-        Initializes the LightningActorCritic module. This method sets up the model with its environment,
-        learning parameters, and the training method. It also checks if all necessary hyperparameters
-        are included for the selected training method.
+        Initializes the LightningActorCritic module with specified environment, model, memory buffer, and hyperparameters.
 
         Args:
-            env: The environment object from which data is generated.
-            model: The actor-critic model which will be trained.
-            memory: A memory buffer for storing training data.
-            hparams: A dictionary containing hyperparameters for training.
-            method (str, optional): The training method to use ('ppo' or 'a3c'). Defaults to 'ppo'.
+            env (gym.Env): The environment object from which data is generated.
+            model (torch.nn.Module): The actor-critic network model.
+            memory (RolloutBuffer): A buffer object for storing rollout data.
+            hparams (Dict[str, Any]): Hyperparameters necessary for the model's operation.
+            method (str): The training methodology to use. Defaults to 'ppo'.
         """
         super(LightningActorCritic, self).__init__()
-        self.env = env  # Environment instance from which the agent will learn
-        self.model = model  # The model to train
-        self.memory = memory  # Rollout buffer to store experience tuples
-        # Save hyperparameters for easy access and reproducibility
+        self.env = env
+        self.model = model
+        self.memory = memory
+        # Automatically logs and saves hyperparameters for future use.
         self.save_hyperparameters(hparams)
-        self.method = method  # Training method, can be 'ppo' or 'a3c'
-        # Initialize a list to store total rewards from each training step
+        self.method = method
+        # A list to store the sum of rewards per batch for monitoring.
         self.total_rewards = []
+        self.epoch_rewards = 0
 
+        # Assert necessary parameters are included for specific methods.
         if self.method == 'ppo':
-            # Ensure PPO-specific parameter is included
             assert 'clip_param' in hparams, "clip_param is required for PPO"
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Defines the forward pass of the model. This method is called with input data, and it passes
-        that data through the model to produce output.
+        Defines the forward pass of the module.
 
         Args:
-            x (Tensor): The input tensor containing state data.
+            x (torch.Tensor): Input state from the environment.
 
         Returns:
-            Tensor: The output from the model, typically action probabilities and state values.
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing the action probabilities and state values.
         """
         return self.model(x)
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch: Tuple[torch.Tensor], batch_idx: int) -> STEP_OUTPUT:
         """
-        Executes a training step using a batch of data. This method handles the computation of loss based on the
-        specified training method and logs the training loss and reward for monitoring.
+        Performs a single training step.
 
         Args:
-            batch: The batch of data to process. Expected to contain states, actions, rewards, dones, log probabilities,
-                   values, returns, and advantages.
-            batch_idx (int): The index of the current batch.
+            batch (Tuple[torch.Tensor]): The batch of data to train on.
+            batch_idx (int): The index of the batch.
 
         Returns:
-            Tensor: The computed loss for the batch, which is used to perform a training update.
+            STEP_OUTPUT: The output after a training step, typically the loss.
         """
-        states, actions, rewards, dones, log_probs, values, returns, advantages = batch
-        new_action_probs, new_values = self.model(
-            states)  # Forward pass through the model
+        total_reward = 0
 
-        # Calculate the probability distribution over actions and corresponding new log probabilities
+        states, actions, rewards, dones, log_probs, values, returns, advantages = batch
+        new_action_probs, new_values = self.model(states)
+
+        # Use categorical distribution to calculate the log probabilities of the actions taken.
         dist = torch.distributions.Categorical(new_action_probs)
         new_log_probs = dist.log_prob(actions)
 
-        # Compute loss depending on the method specified ('a3c' or 'ppo')
+        # Sample an action for each state in the batch
+        sampled_actions = dist.sample()
+
+        for action in sampled_actions:
+            next_state, reward, terminated, truncated, info = self.env.step(
+                action.item())
+            total_reward += reward  # Accumulate reward
+
+            if terminated or truncated:
+                # Episode has ended
+                self.log('episode_total_reward', total_reward,
+                         on_step=False, on_epoch=True, logger=True)
+                self.env.reset()
+                total_reward = 0
+
+        # Accumulate rewards for the epoch
+        self.epoch_rewards += rewards.sum().item()
+
+        # Calculate loss based on the method specified.
         if self.method == 'a3c':
             loss = self.calculate_loss_a3c(
                 log_probs, new_log_probs, values, returns, advantages)
@@ -353,309 +519,258 @@ class LightningActorCritic(pl.LightningModule):
             loss = self.calculate_loss_ppo(
                 log_probs, new_log_probs, values, returns, advantages, self.hparams['clip_param'])
 
-        # Log the training loss and reward for monitoring purposes
-        self.log('train_loss', loss, on_step=True,
-                 on_epoch=True, prog_bar=True, logger=True)
-        total_reward = rewards.sum().item()  # Sum the rewards for the batch
-        # Append total reward to the list
-        self.total_rewards.append(total_reward)
-        self.log('train_reward', total_reward, on_step=True,
-                 on_epoch=True, prog_bar=True, logger=True)
+        return loss
 
-        return loss  # Return the computed loss
-
-    def calculate_loss_a3c(self, old_log_probs, new_log_probs, values, returns, advantages):
+    def calculate_loss_a3c(self, old_log_probs: torch.Tensor, new_log_probs: torch.Tensor, values: torch.Tensor, returns: torch.Tensor, advantages: torch.Tensor) -> torch.Tensor:
         """
-        Calculate the loss for the Asynchronous Advantage Actor-Critic (A3C) method.
-        This method computes separate losses for the actor and the critic, and includes an entropy bonus to encourage exploration.
+        Calculates the loss for the A3C method.
 
         Args:
-            old_log_probs (Tensor): Log probabilities of actions taken, as recorded by the old policy.
-            new_log_probs (Tensor): Log probabilities of actions taken, computed by the new policy.
-            values (Tensor): Values estimated by the critic for each state.
-            returns (Tensor): Actual returns computed from the environment.
-            advantages (Tensor): Advantage estimates used to weight the policy gradient.
+            old_log_probs (torch.Tensor): Log probabilities of the actions under the old policy.
+            new_log_probs (torch.Tensor): Log probabilities of the actions under the current policy.
+            values (torch.Tensor): Value estimates from the critic.
+            returns (torch.Tensor): Returns calculated from the rewards.
+            advantages (torch.Tensor): Advantage estimates.
 
         Returns:
-            Tensor: The total loss calculated as the sum of actor loss, critic loss, and entropy bonus.
+            torch.Tensor: The calculated loss, combining actor loss, critic loss, and entropy bonus for exploration.
         """
-        # Actor loss is calculated to encourage the policy to take actions that lead to higher advantage.
+        # Actor loss encourages the agent to take actions that lead to higher advantage.
         actor_loss = -(advantages * new_log_probs).mean()
-        # Critic loss uses Mean Squared Error to minimize the difference between predicted values and actual returns.
+        # Critic loss measures how well the value function estimates the actual returns.
         critic_loss = F.mse_loss(values.squeeze(), returns)
-        # Entropy bonus adds a term to the loss to encourage exploration by increasing the entropy of the action distribution.
-        entropy_bonus = -0.01 * \
+        # Entropy bonus to encourage exploration
+        entropy_bonus = -0.3 * \
             (new_log_probs * torch.exp(new_log_probs)).mean()
         return actor_loss + 0.5 * critic_loss + entropy_bonus
 
-    def calculate_loss_ppo(self, old_log_probs, new_log_probs, values, returns, advantages, clip_param):
+    def calculate_loss_ppo(self, old_log_probs: torch.Tensor, new_log_probs: torch.Tensor, values: torch.Tensor, returns: torch.Tensor, advantages: torch.Tensor, clip_param: float) -> torch.Tensor:
         """
-        Calculate the loss for the Proximal Policy Optimization (PPO) method.
-        PPO uses a clipped surrogate objective to avoid too large policy updates, which includes an actor loss, a critic loss, and an entropy bonus.
+        Calculates the loss using the Proximal Policy Optimization (PPO) clipping method.
 
         Args:
-            old_log_probs (Tensor): Log probabilities of actions taken, as recorded by the old policy.
-            new_log_probs (Tensor): Log probabilities of actions taken, computed by the new policy.
-            values (Tensor): Values estimated by the critic for each state.
-            returns (Tensor): Actual returns computed from the environment.
-            advantages (Tensor): Advantage estimates, which are the differences between returns and value predictions.
-            clip_param (float): The clipping parameter 'epsilon', which defines how far away the new policy is allowed to go from the old.
+            old_log_probs (torch.Tensor): Log probabilities of the actions under the old policy.
+            new_log_probs (torch.Tensor): Log probabilities of the actions under the current policy.
+            values (torch.Tensor): Value estimates from the critic.
+            returns (torch.Tensor): Returns calculated from the rewards.
+            advantages (torch.Tensor): Advantage estimates.
+            clip_param (float): The PPO clipping parameter.
 
         Returns:
-            Tensor: The total loss, which is the sum of the clipped actor loss, the critic loss, and an entropy bonus.
+            torch.Tensor: The total loss from the actor and critic components.
         """
-        # Calculate the ratio of new to old probabilities for taken actions, and apply clipping to this ratio.
+        # Calculate the ratio of new to old probabilities for determining how much the policy is allowed to change
         ratios = torch.exp(new_log_probs - old_log_probs)
+        # Apply clipping to the ratios within specified bounds to prevent large policy updates
         surr1 = ratios * advantages
         surr2 = torch.clamp(ratios, 1.0 - clip_param,
                             1.0 + clip_param) * advantages
-        # Actor loss is the minimum of unclipped and clipped surrogate objectives, negated to perform gradient ascent.
+        # The actor loss is the minimum of these two surrogateS
         actor_loss = -torch.min(surr1, surr2).mean()
-        # Critic loss minimizes the squared error between estimated values and returns.
+        # The critic loss computes how well the value head predicts the actual returns, using mean squared error
         critic_loss = F.mse_loss(values.squeeze(), returns)
-        # Entropy bonus to promote exploration.
-        entropy_bonus = -0.01 * \
+        # Entropy is added to encourage exploration
+        entropy_bonus = -0.3 * \
             (new_log_probs * torch.exp(new_log_probs)).mean()
         return actor_loss + 0.5 * critic_loss + entropy_bonus
 
-    def configure_optimizers(self):
+    def configure_optimizers(self) -> RMSprop:
         """
-        Setup the optimizer for training the model. This method specifies which optimizer to use and its parameters,
-        such as the learning rate.
+        Configures the optimizer used for training.
 
         Returns:
-            torch.optim.Optimizer: The optimizer configured with model parameters and learning rate.
+            RMSprop: The RMSprop optimizer with the learning rate specified in hyperparameters.
         """
-        # Initialize the Adam optimizer with the model parameters and the learning rate specified in hyperparameters
-        return optim.Adam(self.model.parameters(), lr=self.hparams['lr'])
+        return RMSprop(self.model.parameters(), lr=self.hparams['lr'])
 
-    def train_dataloader(self):
+    def train_dataloader(self) -> TRAIN_DATALOADERS:
         """
-        Prepare the DataLoader for training. This method sets up the DataLoader with the dataset containing
-        training data, batch size, and other parameters necessary for efficient data loading and training.
+        Creates the training DataLoader.
 
         Returns:
-            DataLoader: The DataLoader configured to fetch data for training with shuffling and parallel processing enabled.
+            TRAIN_DATALOADERS: A DataLoader containing the training dataset.
         """
-        # Create a dataset from the memory buffer
         dataset = RolloutBufferDataset(self.memory)
-        # Return a DataLoader to handle batching, shuffling, and multi-thread data loading
-        return DataLoader(dataset, batch_size=self.hparams['batch_size'], shuffle=True, num_workers=11)
+        batch_size = min(self.hparams['batch_size'], len(dataset))
+        return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=11)
 
-    def load_model(self, path):
+    def on_train_epoch_start(self):
         """
-        Load the model from the specified path if it exists. This method looks for the latest model file
-        that starts with the method name ('ppo' or 'a3c') and loads it.
+        Hook that is called at the start of each training epoch.
+        """
+        self.memory.start_epoch()
+
+    def on_train_epoch_end(self, outputs: Optional[Any] = None):
+        """
+        Handles tasks at the end of a training epoch, including data processing, sending data to servers,
+        logging metrics, and checking for convergence.
+
+        Args:
+            outputs (Optional[Any]): Outputs collected from each training step within the epoch.
+        """
+        print("Epoch ended, processing data...")
+
+        # Log epoch time
+        self.memory.finish_epoch()
+
+        # Check if there's data in the memory to process
+        if self.memory.ptr > 0:
+            data = self.memory.get_data()
+
+            if self.method == 'ppo':
+                # Process data for PPO and send data to server
+                self.memory.process_for_ppo()
+                print("Sending PPO data to server.")
+
+            elif self.method == 'a3c':
+                # For A3C compute gradients and send them to the server
+                gradients = self.compute_gradients(data)
+                self.memory.process_for_a3c(gradients)
+                print("Sending A3C gradients to server.")
+
+        # Retrieve and log metrics from the buffer
+        metrics = self.memory.get_metrics()
+        metrics['reward'] = sum(self.memory.episode_scores) / \
+            len(self.memory.episode_scores)
+        metrics['threshold'] = False
+
+        # Check convergence based on specific metrics and log the result
+        if self.reached_threshold(metrics):
+            metrics['threshold'] = True
+
+        # Send accumulated metrics to the server for and analysis
+        self.memory.send_metrics_to_server(metrics)
+
+        # Reset buffer for the next training iteration
+        self.total_rewards = []
+        self.memory.ptr = 0
+        self.memory.path_start_idx = 0
+        self.epoch_rewards = 0
+
+        # Re-populate memory with initial experiences for the next epoch
+        populate_memory(self.env, self.memory, 10000)
+
+    def reached_threshold(self, metrics: Dict[str, Any]) -> bool:
+        """
+        Determines if the model has reached threshold for the specific environment.
+
+        Args:
+            metrics (Dict[str, Any]): Boolean indicating if threshold has been reached in the epoch.
+
+        Returns:
+            bool: True if current reward is equal or higher than threshold, otherwise False.
+        """
+        if self.env.unwrapped.spec.id == "CartPole-v1":
+            return metrics.get('reward', 0) >= 195
+        else:
+            return metrics.get('reward', 0) >= 200
+
+    def compute_gradients(self, data: Dict[str, Any]) -> List[torch.Tensor]:
+        """
+        Computes the gradients for the actor-critic model using the provided batch data.
+
+        Args:
+            data (Dict[str, Any]): A dictionary containing batched data including states, actions,
+                                   rewards, dones, returns, advantages, and log probabilities.
+
+        Returns:
+            List[torch.Tensor]: A list of gradients for all trainable parameters in the model.
+        """
+        # Convert data from NumPy arrays or lists to PyTorch tensors.
+        states = torch.tensor(data['states'], dtype=torch.float32)
+        actions = torch.tensor(data['actions'], dtype=torch.int64)
+        rewards = torch.tensor(data['rewards'], dtype=torch.float32)
+        dones = torch.tensor(data['dones'], dtype=torch.bool)
+        returns = torch.tensor(data['returns'], dtype=torch.float32)
+        advantages = torch.tensor(data['advantages'], dtype=torch.float32)
+        log_probs = torch.tensor(data['log_probs'], dtype=torch.float32)
+
+        # Forward pass through the model to obtain new action probabilities and state values.
+        new_action_probs, values = self.model(states)
+
+        # Compute the probability of the taken actions.
+        dist = torch.distributions.Categorical(new_action_probs)
+        new_log_probs = dist.log_prob(actions)
+
+        # Calculate loss
+        loss = self.calculate_loss_a3c(
+            log_probs, new_log_probs, values, returns, advantages)
+        # Perform backpropagation to compute gradients.
+        loss.backward()
+
+        # Collect gradients.
+        gradients = []
+        for param in self.model.parameters():
+            if param.grad is not None:
+                # Detach gradients and prevent further modification.
+                gradients.append(param.grad.clone().detach())
+            else:
+                # If no gradient for a parameter, append a zero tensor of the same shape.
+                gradients.append(torch.zeros_like(param))
+
+        return gradients
+
+    def load_model(self, path: str, current_model_name: str, method: str, env: str) -> str:
+        """
+        Load the model from the specified path if it exists and if the current model name
+        does not match the latest model file. This method looks for the latest model file
+        that starts with the method name and compares it to the provided
+        current model name.
 
         Args:
             path (str): The file path where model files are stored.
+            current_model_name (str): The name of the current model loaded.
+            method (str): The method used to initialize the agent.
+            env (str): The environment used to initialize the agent to ensure correct dimensions.
 
         Returns:
-            None: Outputs a status message indicating the result of the load operation.
+            str: The name of the loaded model, or None if no loading occurred.
         """
         # Check if the specified path exists
         if os.path.exists(path):
-            # List all files that start with the method name ('ppo' or 'a3c')
-            model_files = [f for f in os.listdir(
-                path) if f.startswith(self.method)]
+            # List all files that start with the method_env prefix
+            prefix = f"{method}_{env}_"
+            model_files = [f for f in os.listdir(path) if f.startswith(prefix)]
             if model_files:
                 # Find the latest model file based on modification time
                 latest_model = max(
                     model_files, key=lambda f: os.path.getmtime(os.path.join(path, f)))
-                # Load the model state from the latest model file
-                self.load_state_dict(torch.load(
-                    os.path.join(path, latest_model)))
-                print(f"Model loaded from {latest_model}")
+                # Check if the current model name matches the latest model file
+                if current_model_name != latest_model:
+                    # Load the model state from the latest model file if different
+                    state_dict = torch.load(os.path.join(path, latest_model))
+
+                    # Ensure the keys are correctly formatted
+                    new_state_dict = {}
+                    for key in state_dict.keys():
+                        new_key = key.replace(
+                            'model.', '') if key.startswith('model.') else key
+                        new_state_dict[new_key] = state_dict[key]
+
+                    self.model.load_state_dict(new_state_dict)
+                    print(f"Agent Model loaded from {latest_model}")
+                    return latest_model
+                else:
+                    print("Current model is up to date.")
+                    return current_model_name
             else:
-                # No model files starting with the method name were found
                 print(
                     "No model found starting with the method used. Starting with a new model.")
+                return None
         else:
-            # The specified model path does not exist
             print("Model path does not exist. Starting with a new model.")
-
-    def save_model(self, path):
-        """
-        Save the model at the specified path. This method ensures that the directory exists,
-        and saves the current state of the model under a filename that includes the method name.
-
-        Args:
-            path (str): The directory path where the model should be saved.
-
-        Returns:
-            None: Outputs a status message indicating where the model was saved.
-        """
-        # Ensure the directory exists, if not, create it
-        if not os.path.exists(path):
-            os.makedirs(path)
-        # Save the model state under a file name that includes the method name
-        torch.save(self.state_dict(), os.path.join(
-            path, f"{self.method}_model.pth"))
-        print(
-            f"Model saved in {os.path.join(path, f'{self.method}_model.pth')}")
-
-
-class A3CAgent(pl.LightningModule):
-    """
-    Class for training an Asynchronous Advantage Actor-Critic (A3C) model with asynchronous updates.
-    This class manages the entire training process, including environment interaction,
-    gradient computation, and asynchronous updates of the model.
-    """
-
-    def __init__(self, env_name, lr):
-        """
-        Initializes the A3C agent with a specific environment and learning rate.
-
-        Args:
-            env_name (str): Name of the gym environment to be used for training.
-            lr (float): Learning rate for the optimizer.
-        """
-        super(A3CAgent, self).__init__()
-        # Create the environment based on the specified name
-        self.env = gym.make(env_name)
-        # Initialize the ActorCritic model using the environment's observation and action spaces
-        self.model = ActorCritic(
-            self.env.observation_space.shape[0], self.env.action_space.n)
-        # Initialize a buffer to store experiences
-        self.buffer = RolloutBuffer(
-            1000, self.env.observation_space, self.env.action_space)
-        self.lr = lr  # Set the learning rate
-
-    def forward(self, x):
-        """
-        Defines the forward pass of the model. This method is called during training and inference
-        to get the model's output based on input data.
-
-        Args:
-            x (Tensor): Input tensor containing state information from the environment.
-
-        Returns:
-            Tensor: The output from the model, action probabilities and state values.
-        """
-        return self.model(x)
-
-    def compute_gradients(self, batch):
-        """
-        Computes gradients for a batch of data. This method is essential for updating the model
-        parameters based on the loss computed from the batch of experiences.
-
-        Args:
-            batch: A batch of data including states, actions, rewards, and dones.
-
-        Returns:
-            Tensor: The total loss for the batch, combining actor and critic losses.
-        """
-        states, actions, rewards, dones = batch
-        # Obtain the probabilities and values from the model for the current states
-        probs, values = self(states)
-        # Use the last state to predict the next values
-        _, next_values = self(states[1:] + [states[0]])
-
-        # Compute the returns by adding rewards to the discounted next values
-        returns = rewards + self.gamma * next_values * (1 - dones)
-        # Calculate advantages as the difference between returns and current estimated values
-        advantages = returns - values
-
-        # Compute log probabilities for the taken actions
-        log_probs = torch.log(probs.gather(
-            1, actions.unsqueeze(-1)).squeeze(-1))
-        # Calculate actor loss as negative log probabilities weighted by advantages
-        actor_loss = -(log_probs * advantages.detach()).mean()
-        # Calculate critic loss as the mean squared error of the advantages
-        critic_loss = advantages.pow(2).mean()
-
-        return actor_loss + critic_loss  # Return the combined loss
-
-    def training_step(self, batch, batch_idx):
-        """
-        Performs a single training step including computing gradients based on the provided batch of data
-        and logging the loss.
-
-        Args:
-            batch: The batch of data to process. The batch contains environment states, actions, rewards, and dones.
-            batch_idx (int): The index of the current batch within the epoch.
-
-        Returns:
-            Tensor: The loss computed from the batch, which will be used by the optimizer to update the model parameters.
-        """
-        # Compute the gradients for the batch
-        loss = self.compute_gradients(batch)
-        # Log the training loss using PyTorch Lightning's logging
-        self.log('train_loss', loss)
-        return loss  # Return the loss for backpropagation
-
-    def train_dataloader(self):
-        """
-        Returns a DataLoader for training the model. Retrieves batches of data from the memory buffer,
-        which are passed to the training step.
-
-        Returns:
-            DataLoader: A DataLoader with batches of experience data from the buffer.
-        """
-        # Create a DataLoader that fetches data from the buffer
-        return DataLoader(self.buffer, batch_size=32)
-
-    def configure_optimizers(self):
-        """
-        Configures the optimizer for training the model. This method specifies which optimizer to use
-        and its parameters, such as the learning rate.
-
-        Returns:
-            torch.optim.Optimizer: The optimizer configured with model parameters and learning rate.
-        """
-        # Initialize the Adam optimizer with the model parameters and the learning rate specified at initialization
-        return optim.Adam(self.model.parameters(), lr=self.lr)
-
-    def on_epoch_end(self):
-        """
-        Called at the end of each training epoch. Sends gradients to the server to perform asynchronous training.
-        """
-        print("Epoch ended, sending gradients to server...")
-        self.send_gradients_to_server()
-
-    def send_gradients_to_server(self):
-        """
-        Sends computed gradients to the server and updates model parameters based on server response.
-        """
-        # Compute gradients from the entire buffer
-        gradients = self.compute_gradients(self.buffer[:])
-        # Serialize the gradients using pickle to prepare them for sending over the network
-        data = pickle.dumps(gradients)
-        # Open a socket connection to the server
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            print(f"Connecting to server at {self.model.server_address}")
-            # Connect to the server at the specified address
-            sock.connect(self.model.server_address)
-            sock.sendall(data)  # Send serialized gradient data to the server
-            print("Gradients sent to server.")
-            # Receive the updated model parameters from the server
-            response = sock.recv(1024)
-            # Deserialize the response to get updated parameters
-            updated_params = pickle.loads(response)
-        print("Received updated parameters from server.")
-        # Update the local model parameters with the new parameters received from the server
-        self.update_model_parameters(updated_params)
-
-    def update_model_parameters(self, new_params):
-        """
-        Updates the model parameters with new parameters received from the server.
-
-        Args:
-            new_params (List[torch.Tensor]): List of tensors containing the updated parameters.
-        """
-        # Iterate over each parameter in the model and the corresponding new parameter received
-        for param, new_param in zip(self.model.parameters(), new_params):
-            # Copy the data from the new parameter to the existing parameter in the model
-            param.data.copy_(new_param.data)
+            return None
 
 
 class RolloutBufferDataset(Dataset):
     """
-    PyTorch Dataset for accessing experiences stored in a RolloutBuffer. Provides an interface for model 
-    experiences that can be iterated over during training.
+    PyTorch Dataset class for accessing and utilizing experiences stored in a RolloutBuffer.
 
-    Args:
-        memory (RolloutBuffer): An instance of RolloutBuffer that stores the experiences.
+    This dataset allows for easy integration with PyTorch's DataLoader to enable efficient
+    batching and processing of experience data collected.
+
+    Attributes:
+        memory (RolloutBuffer): An instance of RolloutBuffer containing training data.
     """
 
     def __init__(self, memory: RolloutBuffer):
@@ -663,42 +778,40 @@ class RolloutBufferDataset(Dataset):
         Initializes the dataset with a memory buffer.
 
         Args:
-            memory (RolloutBuffer): The RolloutBuffer object containing training data.
+            memory (RolloutBuffer): The buffer from which to load data.
         """
         self.memory = memory
 
-    def __len__(self):
+    def __len__(self) -> int:
         """
-        Returns the total number of experiences stored in the buffer.
+        Returns the number of entries in the memory buffer.
 
         Returns:
-            int: The number of experiences in the buffer.
+            int: The total number of experiences stored in the buffer.
         """
         return len(self.memory)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> tuple:
         """
-        Retrieves an individual experience by index. This method allows the dataset to be indexed so that
-        it can be used by DataLoader to generate batches of data.
+        Retrieves an item from the buffer by its index.
 
         Args:
-            idx (int): The index of the experience to retrieve.
+            idx (int): The index of the item to retrieve.
 
         Returns:
-            tuple: A tuple containing state, action, reward, done, log_prob, value, return, and advantage,
-                   corresponding to the indexed experience.
+            tuple: A tuple containing the state, action, reward, done flag, log probability,
+                   value estimate, return, and advantage for the specified index.
 
         Raises:
-            IndexError: If the index is out of the range of the buffer size.
+            IndexError: If the index is out of range of the dataset's length.
         """
-        # Ensure the requested index is within the range of available data
         if idx >= self.__len__():
             raise IndexError("Index out of range")
 
-        # Fetch the data using the get_data method from RolloutBuffer, which returns a dictionary of arrays
+        # Retrieve data from the buffer
         data = self.memory.get_data()
 
-        # Extract and return the data corresponding to the given index
+        # Extract elements for the given index.
         state = data['states'][idx]
         action = data['actions'][idx]
         reward = data['rewards'][idx]
@@ -708,11 +821,10 @@ class RolloutBufferDataset(Dataset):
         return_ = data['returns'][idx]
         advantage = data['advantages'][idx]
 
-        # Return all these components as a tuple
         return state, action, reward, done, log_prob, value, return_, advantage
 
 
-def populate_memory(env, memory, num_initial_experiences):
+def populate_memory(env: gym.Env, memory: RolloutBuffer, num_initial_experiences: int):
     """
     Populate the memory buffer with initial experiences.
 
@@ -727,10 +839,7 @@ def populate_memory(env, memory, num_initial_experiences):
 
     # Process the state to exclude non-numeric data
     if isinstance(state, tuple):
-        # Assuming the first element is the numeric state and the second is a dictionary
         numeric_state = state[0]
-        print(
-            f"Numeric part of the state: {numeric_state}, type: {type(numeric_state)}, shape: {numeric_state.shape}")
 
     for index in range(num_initial_experiences):
         # Sample a random action from the action space
@@ -743,136 +852,170 @@ def populate_memory(env, memory, num_initial_experiences):
         done = terminated or truncated
 
         if isinstance(next_state, tuple):
-            next_state = next_state[0]  # Extract the numeric part only
+            # Extract the numeric part only
+            next_state = next_state[0]
 
         # Convert numeric state to tensor
         state_tensor = torch.tensor(numeric_state, dtype=torch.float32)
+        # Use placeholder values for log_prob and value
         memory.insert(state_tensor, action, reward, done, torch.tensor(
-            0.0), torch.tensor(0.0))  # Placeholder values for log_prob and value
+            0.0), torch.tensor(0.0))
 
         if done:
             state = env.reset()
             if isinstance(state, tuple):
-                state = state[0]  # Extract the numeric part only
+                state = state[0]
         else:
-            numeric_state = next_state  # Update numeric_state for next iteration
+            # Update numeric_state for next iteration
+            numeric_state = next_state
 
-        if memory.ptr >= memory.max_size:  # Stop populating if the buffer is full
+        # Stop populating if the buffer is full
+        if memory.ptr >= memory.max_size:
             break
 
-    print(f"Memory populated: {index+1}/{num_initial_experiences} entries")
 
-
-def main(env_name, model_path=None, method='ppo', server_ip='host.docker.internal', port=0):
+def restart_trainer(trainer: Trainer, max_epochs: int, checkpoint_callback: Callback, logger: CSVLogger) -> Trainer:
     """
-    Main function to configure and run the training loop for an actor-critic model.
+    Re-initializes and configures a PyTorch Lightning Trainer with new settings. 
+    To reset the training environment after a model update or between training phases.
 
     Args:
-        env_name (str): The name of the Gym environment to use for training.
-        model_path (str, optional): Path to save or load the model during training.
-        method (str, optional): The training methodology to use ('ppo' or 'a3c'). Defaults to 'ppo'.
-        server_ip (str, optional): IP address of the server for distributed training. Defaults to 'host.docker.internal'.
-        port (int, optional): Port number for the server. Defaults to 0.
+        trainer (Trainer): The existing trainer instance that will be reconfigured.
+        max_epochs (int): The maximum number of epochs for the new training session.
+        checkpoint_callback (Callback): A callback instance for handling checkpoints during training.
+        logger (Logger): A logging interface compatible with PyTorch Lightning.
 
-    Overview:
-    1. Set up the server address for distributed training.
-    2. Initialize the environment, model, and memory buffer.
-    3. Populate the memory buffer with initial experiences.
-    4. Define hyperparameters for training.
-    5. Initialize the training framework with checkpoints and logging.
-    6. Load the model if a path is provided.
-    7. Run the training loop until a stop event is triggered.
-    8. Save the model upon training completion.
+    Returns:
+        Trainer: A new PyTorch Lightning Trainer instance configured with the specified parameters.
     """
-    # Set the server address for communication during distributed training
-    global SERVER_ADDRESS
-    SERVER_ADDRESS = (server_ip, port)
-
-    # Create the Gym environment with the specified environment name
-    env = gym.make(env_name)
-    # Initialize the ActorCritic model with the server address for distributed updates
-    model = ActorCritic(
-        env.observation_space.shape[0], env.action_space.n, (server_ip, port))
-    # Create a RolloutBuffer with a size of 10000, configured based on the selected method
-    memory = RolloutBuffer(10000, env.observation_space,
-                           env.action_space, use_gae=(method == 'ppo'))
-
-    # Populate memory with initial experiences if not fully populated
-    if len(memory) < memory.max_size:
-        populate_memory(
-            env, memory, num_initial_experiences=memory.max_size - len(memory))
-
-    # Define hyperparameters for training
-    hparams = {
-        'batch_size': 256,  # Size of the batch used in each training step
-        'gamma': 0.75,      # Discount factor for future rewards
-        'lr': 0.001,        # Learning rate for the optimizer
-        'clip_param': 0.2 if method == 'ppo' else None  # Clipping parameter for PPO
-    }
-
-    # Initialize the appropriate Lightning module based on the training method
-    if method == 'ppo':
-        lightning_model = LightningActorCritic(
-            env, model, memory, hparams, method)
-    elif method == 'a3c':
-        lightning_model = A3CAgent(env_name, lr=hparams['lr'])
-
-    # Setup checkpoints and logging
-    checkpoint_callback = ModelCheckpoint(
-        monitor='train_loss',
-        dirpath='./model_checkpoints/',
-        filename=f"{env_name}-{{epoch:02d}}-loss={{train_loss:.2f}}",
-        save_top_k=1,
-        mode='min')
-    logger = CSVLogger("logs", name=method)
-
-    # Configure the trainer with specified hardware acceleration and precision
-    trainer = pl.Trainer(
-        max_epochs=10,
-        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        devices=1 if torch.cuda.is_available() else None,
+    # Reconfigure the existing trainer with new parameters.
+    new_trainer = Trainer(
+        max_epochs=max_epochs,
+        accelerator='cpu',
+        devices=1,
         callbacks=[checkpoint_callback],
         log_every_n_steps=1,
         check_val_every_n_epoch=1,
-        precision=16 if torch.cuda.is_available() else 32,
-        logger=logger)
+        precision=32,
+        logger=logger
+    )
 
-    # Load the model if a path is specified
-    lightning_model.load_model(model_path)
+    return new_trainer
 
-    # Training loop
-    while not STOP_EVENT.is_set():
+
+def main(env_name: str, method: str, max_epochs: int, conn: int):
+    """
+    Main training function for initializing and running the training loop.
+
+    Args:
+        env_name (str): Name of the gym environment to use.
+        method (str): Specifies the training method.
+        max_epochs (int): Maximum number of training epochs.
+        conn (int): File descriptor for the pipe connection.
+
+    Steps:
+        1. Convert the file descriptor to a connection object.
+        2. Set up the environment and model.
+        3. Configure and initiate training.
+        4. Handle dynamic updates based on incoming messages over the connection.
+            4.1 For PPO start training, send data to server and wait for response to resume training
+            4.2 For A3C start training, send data and continue training while server send a response
+    """
+    # Convert the file descriptor into a connection object.
+    connection = Connection(conn)
+    print(f"Environment name: {env_name}, Type: {type(env_name)}")
+
+    # Initialize the environment and model.
+    env = gym.make(env_name)
+    env = RecordEpisodeStatistics(env)
+    model = ActorCritic(env.observation_space.shape[0], env.action_space.n)
+    memory = RolloutBuffer(10000, env.observation_space, env.action_space,
+                           method, use_gae=(method == 'ppo'), env_name=env_name, score_threshold=200 if env_name == 'LunarLander-v3' else 195)
+
+    # Populate the memory with initial data.
+    populate_memory(env, memory, 10000)
+
+    # Define hyperparameters and create the Lightning module.
+    hparams = {'batch_size': 64, 'lr': 0.1,
+               'clip_param': 0.3 if method == 'ppo' else None}
+    lightning_model = LightningActorCritic(env, model, memory, hparams, method)
+
+    # Setup logger and checkpointing.
+    logger = CSVLogger("/logs", name=method)
+
+    checkpoint_callback = ModelCheckpoint(
+        monitor='train_loss',
+        dirpath='/home/david/Documents/TFG/model_checkpoints/',
+        filename=f"{env_name}-{{epoch:02d}}-loss={{train_loss:.2f}}",
+        save_top_k=1,
+        mode='min'
+    )
+
+    # Load latest global model to resume training
+    last_loaded_model = lightning_model.load_model(
+        MODEL_LOAD_PATH, None, method, env_name)
+
+    # Initialize the trainer with the specified configurations.
+    trainer = Trainer(
+        max_epochs=max_epochs,
+        accelerator='cpu',
+        devices=1,
+        callbacks=[checkpoint_callback],
+        log_every_n_steps=1,
+        check_val_every_n_epoch=1,
+        precision=32,
+        logger=logger
+    )
+
+    print(f"Memory size after population: {len(memory)}")
+
+    # Start the training loop.
+    if method == 'ppo':
+        # Training loop for PPO.
         trainer.fit(lightning_model)
-        # Check and apply updates from the server
-        check_for_model_update(model)
-        time.sleep(10)  # Sleep for a while before next training cycle
-
-    # Save the model at the specified path upon completion
-    lightning_model.save_model(model_path)
+        # Listen for commands over the connection.
+        while True:
+            message = connection.recv()
+            # Wait till a new model is sent from the server to resume training
+            if message['command'] == 'update':
+                trainer = restart_trainer(
+                    trainer, max_epochs, checkpoint_callback, logger)
+                last_loaded_model = lightning_model.load_model(
+                    MODEL_LOAD_PATH, last_loaded_model, method, env_name)
+                connection.send({'status': 'params_updated'})
+                trainer.fit(lightning_model)
+            elif message['command'] == 'stop':
+                break
+    elif method == 'a3c':
+        # Continuous training loop for A3C.
+        try:
+            while True:
+                trainer = restart_trainer(
+                    trainer, max_epochs, checkpoint_callback, logger)
+                trainer.fit(lightning_model)  # Continuous training.
+                if connection.poll():  # Check for new messages.
+                    message = connection.recv()
+                    # Continue training even if a new model is not sent from the server
+                    if message['command'] == 'update':
+                        last_loaded_model = lightning_model.load_model(
+                            MODEL_LOAD_PATH, last_loaded_model, method, env_name)
+                    elif message['command'] == 'stop':
+                        break
+        finally:
+            connection.close()
 
 
 if __name__ == '__main__':
-    # Argument parser for command line arguments
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Run distributed RL training.")
+    parser.add_argument('--env_name', type=str, required=True,
+                        help='Name of the gym environment.')
+    parser.add_argument('--method', type=str, required=True,
+                        choices=['ppo', 'a3c'], help='Training method.')
+    parser.add_argument('--max_epochs', type=int, required=True,
+                        help='Maximum number of training epochs.')
+    parser.add_argument('--conn', type=int, required=True,
+                        help='File descriptor for the pipe connection.')
 
-    # Add argument for the environment name (mandatory)
-    parser.add_argument("--env_name", type=str,
-                        help="Name of the environment to train on.", default="LunarLander-v2")
-
-    # Add argument for the model path (optional)
-    parser.add_argument("--model_path", type=str,
-                        help="Path to load the model checkpoint.", default=None)
-
-    # Add argument for the training method (optional, with default)
-    parser.add_argument("--method", type=str, choices=['a3c', 'ppo'], help="Training method to use: 'a3c' or 'ppo'.",
-                        default='ppo')
-
-    # Add argument for the server port (optional, with default)
-    parser.add_argument("--port", type=int,
-                        help="Port number for the server to listen on.", default=0)
-
-    # Parse arguments
     args = parser.parse_args()
-
-    # Call the main function with parsed arguments
-    main(args.env_name, args.model_path, args.method)
+    main(args.env_name, args.method, args.max_epochs, args.conn)

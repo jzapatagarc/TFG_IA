@@ -1,259 +1,384 @@
-from flask import Flask, request, jsonify
-import docker_management as docker_mgmt
-import rl_algorithms as rl
 import os
-import socket
 import pickle
-from threading import Thread
 import torch
-import torch.optim as optim
-import gym
+import gymnasium as gym
+from multiprocessing import Process, Pipe
+from agent import ActorCritic
+from typing import List, Dict, Tuple
+from torch.optim import RMSprop
+import subprocess
+import sys
+import time
+import rl_algorithms as rl
+import datetime
+import pandas as pd
+import shutil
+import re
 
-# Paths configuration for the models
-# Path to load the local model
-LOCAL_MODELS_PATH = '/home/david/Documents/app/local_models'
-# Path to save the global model
-GLOBAL_MODEL_PATH = '/home/david/Documents/app/global_models'
+# Nombre alumno: José David Zapata García
+# Usuario campus: jzapatagarc
 
-# Initialize the Flask application
-app = Flask(__name__)
+# Constants for the paths
+GLOBAL_MODEL_PATH = '/home/david/Documents/TFG/global'
+DATA_PATH = '/home/david/Documents/TFG/data'
+METRICS_PATH = '/home/david/Documents/TFG/metrics'
+CSV_PATH = '/home/david/Documents/TFG/csv'
+OLD_CSV_PATH = '/home/david/Documents/TFG/old_csv'
 
 
-def load_global_model(method, env_name):
+def ensure_directories_exist():
     """
-    Load the global model based on the specified method and environment, and initialize the optimizer.
+    Ensures that necessary directories exist for storing models and data, creating them if they do not exist.
+    """
+    # Create directories if they don't exist, with no error if they already exist
+    os.makedirs(GLOBAL_MODEL_PATH, exist_ok=True)
+    os.makedirs(DATA_PATH, exist_ok=True)
+
+
+def load_global_model(method: str, env_name: str) -> (torch.nn.Module, RMSprop):
+    """
+    Loads the most recent global model for a given method and environment, or initializes a new model if none exist.
 
     Args:
-        method (str): The training method to use, which determines the type of model architecture.
-        env_name (str): The name of the gym environment to determine the input and output dimensions for the model.
-    """
-    global global_model, optimizer  # Declare global variables for the model and optimizer
+        method (str): The name of the method used as part of the model's file naming.
+        env_name (str): The name of the environment to tailor the model's input and output dimensions.
 
-    # Create a gym environment to obtain input and output dimensions based on the environment's configuration
+    Returns:
+        Tuple[torch.nn.Module, torch.optim.Optimizer]: A tuple containing the loaded or newly created model and its optimizer.
+    """
+    # Ensure required directories are available
+    ensure_directories_exist()
+
+    # Initialize the environment to determine model dimensions
     env = gym.make(env_name)
-    # Input dimensions from the environment's observation space
     input_dim = env.observation_space.shape[0]
-    # Output dimensions from the environment's action space
     output_dim = env.action_space.n
 
-    # Initialize the global model using the input and output dimensions
+    # Initialize the global model
     global_model = rl.ActorCritic(input_dim, output_dim)
 
-    # Path where global models are stored
-    model_files = [f for f in os.listdir(
-        GLOBAL_MODEL_PATH) if f.startswith(method)]
-    # Check if there are any saved models that start with the specified method
+    # Search for existing models for the specified method and environment
+    model_files = [f for f in os.listdir(GLOBAL_MODEL_PATH)
+                   if f.startswith(f"{method}_{env_name}")]
+
     if model_files:
-        # If there are saved models, load the most recent model
+        # Identify the most recent model file based on the modification time
         latest_model_file = max(model_files, key=lambda f: os.path.getmtime(
             os.path.join(GLOBAL_MODEL_PATH, f)))
         global_model.load_state_dict(torch.load(
             os.path.join(GLOBAL_MODEL_PATH, latest_model_file)))
         print(f"Global model loaded from {latest_model_file}")
     else:
-        # If no models are found, start with a new model
         print("No global model found. Starting with a new model.")
 
-    # Initialize the optimizer for the global model
-    # Set learning rate for the optimizer
-    optimizer = optim.Adam(global_model.parameters(), lr=0.001)
+    # Initialize the optimizer
+    optimizer = RMSprop(global_model.parameters(), lr=0.1)
+
+    return global_model, optimizer
 
 
-def handle_a3c_updates(port=0):
+def should_process_file(filename: str, method: str, env: str) -> bool:
     """
-    Handles incoming A3C gradient updates over a network socket, updates the global model,
-    and broadcasts the updated parameters to all connected A3C agents.
+    Determines whether a file should be processed based on the specified method and environment.
 
     Args:
-        port (int): The port number on which the server listens for incoming gradient updates. Defaults to 0
+        filename (str): The name of the file to check.
+        method (str): The method used in the training.
+        env (str): The environment name associated with the file.
+
+    Returns:
+        bool: True if the file matches the method and environment, False otherwise.
     """
-    # Create a socket object using IPv4 and TCP protocol
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Bind the socket to localhost on the specified port
-    s.bind(('127.0.0.1', port))
-    # Start listening for incoming connections
-    s.listen()
-    # Retrieve and print the port number
-    port = s.getsockname()[1]
-    print(f"A3C listening on port: {port}")
-
-    while True:  # Server runs continuously
-        # Accept a connection from an A3C agent
-        conn, addr = s.accept()
-        print(f"A3C connection accepted from: {addr}")
-        # Receive data from the connection, expecting a pickle object
-        data = conn.recv(4096)
-        print("A3C gradients received.")
-        # Deserialize the data to get gradients
-        gradients = pickle.loads(data)
-
-        # Load the current global model from file
-        global_model = torch.load(GLOBAL_MODEL_PATH)
-        # Initialize the optimizer with the current model parameters and specified learning rate
-        optimizer = optim.Adam(global_model.parameters(), lr=0.001)
-        # Apply the received gradients to the global model and get updated parameters
-        updated_params = rl.apply_a3c_gradients(
-            gradients, global_model, optimizer)
-        # Save the updated global model back to the file system
-        torch.save(global_model.state_dict(), GLOBAL_MODEL_PATH)
-        print("A3C global model updated and saved.")
-
-        # Send the updated model parameters back to the agent
-        conn.send(pickle.dumps(updated_params))
-        print("A3C updated parameters sent back.")
-        # Close the connection
-        conn.close()
+    pattern = f"^{re.escape(method)}_{re.escape(env)}_metrics_.*\\.pkl$"
+    return re.match(pattern, filename) is not None
 
 
-def handle_ppo_updates(port=0):
+def update_csv_with_data(method: str, env_name: str, num_agents: int):
     """
-    Handles incoming PPO experiences over a network socket, updates the global model,
-    and broadcasts the updated parameters to all connected PPO agents.
+    Updates CSV files with data from processed files, organizing them by method, environment, and number of agents.
+
+    This function collects metric data from .pkl files, aggregates them into a DataFrame, and then appends or creates
+    CSV files based on the method, environment, and number of agents. Processed files are then archived.
 
     Args:
-        port (int): The port number on which the server listens for incoming experiences. Defaults to 0
+        method (str): Training method used.
+        env_name (str): Environment name.
+        num_agents (int): Number of agents involved in the data generation.
     """
-    # Create a TCP/IP socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Bind the socket to localhost on the given port
-    s.bind(('127.0.0.1', port))
-    s.listen()  # Start listening for incoming connections
-    # Report the port it's listening on
-    print(f"PPO listening on port: {s.getsockname()[1]}")
+    # List all .pkl files and sort them by modification time for processing in order
+    files = [f for f in os.listdir(METRICS_PATH) if f.endswith('.pkl')]
+    sorted_files = sorted(files, key=lambda x: os.path.getmtime(
+        os.path.join(METRICS_PATH, x)))
+
+    data_frames: Dict[str, pd.DataFrame] = {}
+
+    # Iterate over each file
+    for file in sorted_files:
+        # Check if the file matches the criteria for processing
+        if should_process_file(file, method, env_name):
+            full_path = os.path.join(METRICS_PATH, file)
+            # Load the data from the file
+            with open(full_path, 'rb') as f:
+                print("Loading data from file:", file)
+                data = pickle.load(f)
+
+            # Compose a name based on method, environment, and number of agents
+            key = f"{method}_{env_name}_{num_agents}_agents"
+            file_path = os.path.join(CSV_PATH, f"{key}_aggregated_metrics.csv")
+
+            # Convert loaded data to DataFrame and initialize or append to existing DataFrame
+            new_data = pd.DataFrame(data, index=[0])
+            if os.path.exists(file_path):
+                df = pd.read_csv(file_path)
+            else:
+                df = pd.DataFrame()
+
+            # Concatenate new data to the existing DataFrame
+            df = pd.concat([df, new_data], ignore_index=True)
+            print("Appending new data to CSV for:", key)
+
+            # Move processed file to an archive directory to avoid reprocessing
+            old_file_path = os.path.join(OLD_CSV_PATH, file)
+            shutil.move(full_path, old_file_path)
+
+            # Update the data_frames dictionary
+            data_frames[key] = df
+
+    # Save updated DataFrames to CSV files
+    for key, df in data_frames.items():
+        file_path = os.path.join(CSV_PATH, f"{key}_aggregated_metrics.csv")
+        df.to_csv(file_path, index=False)
+        print(f"CSV file updated for {key} at {file_path}")
+
+
+def continuous_update(method: str, env_name: str, num_agents: int):
+    """
+    Continuously updates CSV files with data from agents at regular intervals.
+
+    Args:
+        method (str): The training method used.
+        env_name (str): The name of the environment.
+        num_agents (int): Number of agents participating in the training.
+
+    This function runs indefinitely until manually interrupted, updating CSV data files every 10 seconds.
+    """
+    try:
+        while True:
+            update_csv_with_data(method, env_name, num_agents)
+            time.sleep(10)
+    except KeyboardInterrupt:
+        print("Update stopped manually.")
+
+
+def update_model(agent_conns: List[Pipe], method_filter: str, env_name: str):
+    """
+    Continuously updates the global model based on the data received from agents, for 'ppo' and 'a3c' methods.
+
+    Args:
+        agent_conns (List[Pipe]): Connections to agents to send commands after updates.
+        method_filter (str): Specifies the method to filter data files and manage updates.
+        env_name (str): The environment name for which the model is being trained.
+
+    The function processes incoming data files, applies updates to the global model, and notifies agents of updates.
+    """
+    print(f"Starting update model process for {method_filter}...")
+    # Temporary storage for data until all agents have reported.
+    data_storage = []
 
     while True:
-        conn, addr = s.accept()  # Accept a new connection
-        print(f"PPO connection accepted from: {addr}")
+        # List all relevant data files in the specified directory.
+        data_files = [f for f in os.listdir(DATA_PATH) if f.startswith(
+            method_filter) and f.endswith('.pkl')]
 
-        data = conn.recv(4096)  # Receive data from the connection
-        print("PPO experiences received.")
-        experiences = pickle.loads(data)  # Deserialize the received data
+        for file_name in data_files:
+            file_path = os.path.join(DATA_PATH, file_name)
+            with open(file_path, 'rb') as f:
+                data = pickle.load(f)
 
-        # Load the global model and create an optimizer
-        model = torch.load(GLOBAL_MODEL_PATH)
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
+            method = data['type']
+            model_data = data['model_data']
 
-        # Apply the received experiences to update the model
-        updated_params = rl.apply_ppo_experiences(
-            experiences, model, optimizer)
-        # Save the updated model parameters
-        torch.save(model.state_dict(), GLOBAL_MODEL_PATH)
-        print("PPO global model updated and saved.")
+            # Handle data according to the specified method.
+            if method == 'ppo':
+                data_storage.append((model_data, env_name))
+            elif method == 'a3c':
+                # Load the global model and apply A3C gradients immediately.
+                global_model, optimizer = load_global_model(method, env_name)
+                print("Applying A3C gradients.")
+                rl.apply_a3c_gradients(model_data, global_model, optimizer)
+                save_and_notify(global_model, method, env_name, agent_conns)
 
-        # Serialize the updated model parameters and send them back to the agent
-        conn.send(pickle.dumps(updated_params))
-        print("PPO updated parameters sent back.")
-        conn.close()  # Close the connection to handle the next one
+            # Remove the file after processing to prevent re-processing.
+            os.remove(file_path)
+
+        # If all data has been received for PPO, apply model updates.
+        if method_filter == 'ppo' and len(data_storage) >= len(agent_conns):
+            print("Received data from all agents for PPO, applying model updates...")
+            for model_data, env in data_storage:
+                global_model, optimizer = load_global_model(method_filter, env)
+                print("Applying PPO experiences.")
+                rl.apply_ppo_experiences(model_data, global_model, optimizer)
+                save_and_notify(global_model, method_filter, env, agent_conns)
+
+            # Clear the storage after processing.
+            data_storage = []
+
+        time.sleep(1)
 
 
-@app.route('/start', methods=['POST'])
-def start_training():
+def save_and_notify(global_model: ActorCritic, method: str, env_name: str, agent_conns: List[Pipe]):
     """
-    Start training environments based on specified parameters, setting up Docker containers.
-    This endpoint initializes the global model, starts training sessions according to the specified method (A3C or PPO),
-    and manages Docker containers for distributed training.
+    Saves the updated global model and notifies all agents to update their local models.
 
-    Request JSON structure:
-        {
-            "num_instances": int,    # Number of training instances (containers) to start
-            "image_name": str,       # Docker image name to use for the containers
-            "method": str,           # Training method, either 'a3c' or 'ppo'
-            "env_name": str          # Gym environment name for the training
-        }
+    Args:
+        global_model (ActorCritic): The updated global model to be saved.
+        method (str): The method used, either 'ppo' or 'a3c'.
+        env_name (str): The environment name associated with the model.
+        agent_conns (List[Pipe]): List of connections to agents to send update commands.
+
+    Saves the model to the GLOBAL_MODEL_PATH with a timestamp and notifies all agents.
+    """
+    # Save the updated model
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_filename = f"{method}_{env_name}_{timestamp}.pth"
+    torch.save(global_model.state_dict(), os.path.join(
+        GLOBAL_MODEL_PATH, model_filename))
+    print(f"{method.upper()} model updated and saved.")
+
+    # Send update command to all agents
+    for conn in agent_conns:
+        conn.send({'command': 'update'})
+
+
+def start_agent(env_name: str, method: str, max_epochs: int) -> Tuple[Process, Pipe]:
+    """
+    Starts an agent process to train using specified environment and method settings,
+    creating a bidirectional communication channel via a Pipe.
+
+    Args:
+        env_name (str): The name of the training environment.
+        method (str): The training method to use.
+        max_epochs (int): The maximum number of epochs the agent should train for.
 
     Returns:
-        JSON: A response with a message indicating success and a list of container IDs if applicable.
+        Tuple[Process, Pipe]: A tuple containing the Process object of the agent and the parent connection Pipe.
     """
-    # Parse the JSON data sent with the request
-    data = request.json
-    method = data['method']
-    env_name = data['env_name']
+    # Get the directory where the current script is located.
+    script_dir = os.path.dirname(__file__)
+    # Path to the agent script.
+    agent_script_path = os.path.join(script_dir, 'agent.py')
 
-    # Load the global model with the specified method and environment name
-    load_global_model(method, env_name)
+    # Create a Pipe for bidirectional communication.
+    parent_conn, child_conn = Pipe()
 
-    # Function that starts Docker containers and returns their instances
-    containers = docker_mgmt.start_docker_instances_with_args(
-        num_instances=data['num_instances'],
-        image_name=data['image_name'],
-        method=data['method'],
-        env_name=data['env_name'],
-        port=data['port']
-    )
+    # Configure the file descriptor of the child side to be inheritable.
+    fd = child_conn.fileno()
+    os.set_inheritable(fd, True)
 
-    # Depending on the method, start the update handling thread
-    if method == 'a3c':
-        a3c_thread = Thread(target=handle_a3c_updates)
-        a3c_thread.start()  # Start thread to handle asynchronous updates from A3C agents
-    elif method == 'ppo':
-        ppo_thread = Thread(target=handle_ppo_updates)
-        ppo_thread.start()  # Start thread to handle updates from PPO agents
+    # Start the agent process, passing the file descriptor as an argument.
+    p = Process(target=invoke_agent_script, args=(
+        fd, agent_script_path, env_name, method, max_epochs))
+    p.start()
 
-    # Gather container IDs to return in the response
-    container_ids = [c.id for c in containers]
-
-    # Return a JSON response indicating the training has started and providing the IDs of the containers
-    return jsonify({'message': 'Training environments initiated', 'container_ids': container_ids}), 200
+    return p, parent_conn
 
 
-@app.route('/stop', methods=['POST'])
-def stop_training():
+def invoke_agent_script(conn_fd: int, agent_script_path: str, env_name: str, method: str, max_epochs: int):
     """
-    Stops specified Docker containers based on container IDs provided in the POST request.
+    Invokes an agent script with necessary parameters as command-line arguments,
+    including a connection file descriptor for command communication.
 
-    Request JSON structure:
-        {
-            "containers": List[str]  # List of Docker container IDs to stop
-        }
-
-    Returns:
-        JSON: A response with a message confirming that the specified containers have been stopped.
+    Args:
+        conn_fd (int): File descriptor for the connection to communicate with the parent process.
+        agent_script_path (str): File path to the agent script.
+        env_name (str): Name of the environment in which the agent will operate.
+        method (str): The training method.
+        max_epochs (int): Maximum number of training epochs.
     """
-    # Extract the list of container IDs from the request JSON body
-    container_ids = request.json.get('containers', [])
-
-    # Check if the container list is empty and return an error message if it is
-    if not container_ids:
-        return jsonify({'error': 'No container IDs provided'}), 400
-
-    # Stop the specified containers
-    docker_mgmt.stop_docker_instances(container_ids)
-
-    print(f"Stopped Docker containers with IDs: {container_ids}")
-
-    # Return a JSON response indicating that the containers have been stopped
-    return jsonify({'message': 'Containers stopped successfully'}), 200
+    cmd = [
+        # Use the Python executable that's running the script
+        sys.executable, agent_script_path,
+        '--env_name', env_name,
+        '--method', method,
+        '--max_epochs', str(max_epochs),
+        '--conn', str(conn_fd)
+    ]
+    subprocess.run(cmd, close_fds=False)
 
 
-@app.route('/cleanup', methods=['GET'])
-def cleanup():
+def user_interaction():
     """
-    Cleans up all stopped or exited Docker containers to free up system resources.
+    Handles user commands to manage training processes interactively. Allows starting, stopping,
+    and exiting agent training sessions dynamically based on user input.
 
-    It starts a cleanup process that removes any Docker containers that have stopped running or have exited.
-
-    Returns:
-        A JSON response with a message confirming that the cleanup has been completed.
+    This function interacts with the user through the console to control training processes for different
+    training methods and environments. It manages processes and communication pipes to ensure coordinated
+    operations between the main process and spawned agent processes.
     """
+    # List to keep track of agent training processes
+    agent_processes: List[Process] = []
+    # Connections for sending commands to agents
+    agent_conns: List[Pipe] = []
 
-    # Call the cleanup function to remove stopped or exited containers
-    docker_mgmt.cleanup_containers()
+    try:
+        while True:
+            command = input(
+                "Enter command (start/stop/exit): ").strip().lower()
+            if command == "start":
+                # Prompt the user for necessary details to start the training
+                env_name = input("Enter environment name: ").strip()
+                method = input("Enter method (ppo/a3c): ").strip().lower()
+                max_epochs = int(input("Enter max epochs: ").strip())
+                num_instances = int(
+                    input("Enter number of instances: ").strip())
 
-    print("Cleanup process initiated for stopped and exited Docker containers.")
+                for _ in range(num_instances):
+                    # Start each agent as a separate process
+                    process, conn = start_agent(env_name, method, max_epochs)
+                    agent_processes.append(process)
+                    agent_conns.append(conn)
 
-    # Return a JSON response indicating that the cleanup has been successfully completed
-    return jsonify({'message': 'Cleaned up exited containers successfully'}), 200
+                # Start background processes to handle model updates and metrics collection
+                model_update_process = Process(
+                    target=update_model, args=(agent_conns, method, env_name))
+                model_update_process.start()
+                print(f"Model update process started for {method}.")
+
+                metrics_process = Process(
+                    target=continuous_update, args=(method, env_name, num_instances))
+                metrics_process.start()
+                print("Metrics aggregation process started.")
+
+            elif command == "stop":
+                # Stop all active training processes
+                print("Stopping all agents.")
+                for process in agent_processes:
+                    # Terminate each process
+                    process.terminate()
+                # Clear the list to start fresh
+                agent_processes.clear()
+
+            elif command == "exit":
+                # Exit the program stopping all processes
+                print("Exiting. Stopping all agents and update processes.")
+                for process in agent_processes:
+                    # Ensure all agent processes are terminated
+                    process.terminate()
+                # Clear the process list
+                agent_processes.clear()
+                # Break the loop to exit the program
+                break
+
+    finally:
+        # Ensure all processes are terminated on exit to prevent orphan processes
+        for process in agent_processes:
+            if process.is_alive():
+                process.terminate()
+        print("All processes have been terminated.")
 
 
 if __name__ == '__main__':
-    # Starting background threads for handling A3C and PPO updates
-    a3c_thread = Thread(target=handle_a3c_updates, args=(0,))
-    a3c_thread.daemon = True  # Set as a daemon so it does not block the main thread
-    a3c_thread.start()
-
-    ppo_thread = Thread(target=handle_ppo_updates, args=(0,))
-    ppo_thread.daemon = True
-    ppo_thread.start()
-
-    # Run the Flask application on localhost at an automatically assigned port
-    app.run(debug=True, host='127.0.0.1', port=0)
+    # Ensure that all directories exist or create them
+    ensure_directories_exist()
+    # Start the user interaction loop
+    user_interaction()
